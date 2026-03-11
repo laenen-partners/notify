@@ -1,8 +1,8 @@
 // Package notify provides a lightweight event dispatcher for domain events.
 //
 // Stream scope invalidations are published directly to NATS (fast path, no RPC).
-// Emails are sent directly via SMTP. Other notification channels (SMS, push) are
-// forwarded to a notification service via a pluggable Dispatcher interface.
+// Emails are sent via the notification service Connect-RPC API. Other channels
+// (SMS, push) are forwarded via a pluggable Dispatcher interface.
 package notify
 
 import (
@@ -10,9 +10,12 @@ import (
 	"fmt"
 	"strings"
 
+	"connectrpc.com/connect"
 	"github.com/nats-io/nats.go"
 
 	"github.com/laenen-partners/notify/email"
+	notifyv1 "github.com/laenen-partners/notify/gen/notify/v1"
+	"github.com/laenen-partners/notify/gen/notify/v1/notifyv1connect"
 )
 
 const defaultPrefix = "dsx.scope"
@@ -21,16 +24,13 @@ const defaultPrefix = "dsx.scope"
 type Event struct {
 	// Scopes to invalidate in DSX streams.
 	// Published directly to NATS — only scope IDs, nil payload.
-	// Example: "family:members", "document:abc123"
 	Scopes []string
 
 	// Kind identifies the domain event type for routing to notification channels.
-	// Example: "member.added", "document.processed", "invitation.sent"
 	// When empty, the event is stream-only (no dispatch to notification service).
 	Kind string
 
 	// ActorID identifies who or what triggered the event.
-	// A member ID for user actions, "system" for workflows/jobs.
 	ActorID string
 
 	// FamilyID scopes the event to a family.
@@ -39,13 +39,11 @@ type Event struct {
 	// EntityIDs lists the entities involved in the event.
 	EntityIDs []string
 
-	// Emails to send as part of this event.
-	// Sent directly via SMTP — no RPC hop.
+	// Emails to send via the notification service.
 	Emails []email.Message
 }
 
 // Dispatcher forwards domain events to notification channels.
-// Implement this to integrate with the notification Connect-RPC service.
 type Dispatcher interface {
 	Dispatch(ctx context.Context, event Event) error
 }
@@ -63,16 +61,23 @@ func WithDispatcher(d Dispatcher) Option {
 	return func(c *Client) { c.dispatcher = d }
 }
 
-// WithEmail sets an email sender for direct SMTP delivery.
+// WithNotificationService sets the Connect-RPC client for the notification
+// service. When configured, emails are sent via the service's SendEmail RPC.
+func WithNotificationService(client notifyv1connect.NotificationServiceClient) Option {
+	return func(c *Client) { c.rpc = client }
+}
+
+// WithEmail sets a direct email sender (bypasses the notification service).
+// Use this for simple setups where no notification service is running.
 func WithEmail(s email.Sender) Option {
 	return func(c *Client) { c.email = s }
 }
 
 // Client dispatches domain events. Stream scopes go directly to NATS.
-// Emails go directly via SMTP. Non-stream events are forwarded to an
-// optional Dispatcher.
+// Emails go via the notification service Connect-RPC API (or direct SMTP as fallback).
 type Client struct {
 	nc         *nats.Conn
+	rpc        notifyv1connect.NotificationServiceClient
 	email      email.Sender
 	dispatcher Dispatcher
 	prefix     string
@@ -81,7 +86,7 @@ type Client struct {
 // New creates a notify client.
 //
 //	nc   — NATS connection for direct stream scope publishing.
-//	opts — optional configuration (email sender, dispatcher, subject prefix).
+//	opts — optional configuration (notification service, email sender, dispatcher).
 func New(nc *nats.Conn, opts ...Option) *Client {
 	c := &Client{nc: nc, prefix: defaultPrefix}
 	for _, o := range opts {
@@ -93,9 +98,8 @@ func New(nc *nats.Conn, opts ...Option) *Client {
 // Notify dispatches an event.
 //
 // Stream scopes are published directly to NATS as topic-only messages (nil payload).
-// Emails are sent directly via SMTP when an email sender is configured.
-// If the event has a Kind and a Dispatcher is configured, it is also forwarded
-// for potential SMS/push delivery.
+// Emails are sent via the notification service RPC (preferred) or direct SMTP (fallback).
+// If the event has a Kind and a Dispatcher is configured, it is also forwarded.
 func (c *Client) Notify(ctx context.Context, event Event) error {
 	// Fast path: publish scope invalidations directly to NATS.
 	for _, scope := range event.Scopes {
@@ -105,16 +109,14 @@ func (c *Client) Notify(ctx context.Context, event Event) error {
 		}
 	}
 
-	// Send emails directly via SMTP.
-	if c.email != nil {
-		for _, msg := range event.Emails {
-			if err := c.email.Send(msg); err != nil {
-				return fmt.Errorf("notify: send email to %q: %w", msg.To, err)
-			}
+	// Send emails via notification service RPC (preferred) or direct SMTP (fallback).
+	for _, msg := range event.Emails {
+		if err := c.sendEmail(ctx, msg); err != nil {
+			return fmt.Errorf("notify: send email to %q: %w", msg.To, err)
 		}
 	}
 
-	// Forward to notification service for other channels.
+	// Forward to dispatcher for other channels.
 	if c.dispatcher != nil && event.Kind != "" {
 		if err := c.dispatcher.Dispatch(ctx, event); err != nil {
 			return fmt.Errorf("notify: dispatch %q: %w", event.Kind, err)
@@ -124,8 +126,24 @@ func (c *Client) Notify(ctx context.Context, event Event) error {
 	return nil
 }
 
+// sendEmail sends an email via the notification service RPC or direct SMTP.
+func (c *Client) sendEmail(ctx context.Context, msg email.Message) error {
+	if c.rpc != nil {
+		_, err := c.rpc.SendEmail(ctx, connect.NewRequest(&notifyv1.SendEmailRequest{
+			To:      msg.To,
+			Subject: msg.Subject,
+			Html:    msg.HTML,
+			Text:    msg.Text,
+		}))
+		return err
+	}
+	if c.email != nil {
+		return c.email.Send(msg)
+	}
+	return nil
+}
+
 // scopeToSubject converts a colon-separated scope to a dot-separated NATS subject.
-// "family:members" → "family.members"
 func scopeToSubject(scope string) string {
 	return strings.ReplaceAll(scope, ":", ".")
 }

@@ -17,7 +17,11 @@ import (
 	"github.com/laenen-partners/notify/email"
 )
 
-var testSeq atomic.Int64
+var testSeq = func() *atomic.Int64 {
+	v := &atomic.Int64{}
+	v.Store(time.Now().UnixNano() % 1_000_000)
+	return v
+}()
 
 func uniqueAddr(prefix string) string {
 	return fmt.Sprintf("notify-%s-%d@example.com", prefix, testSeq.Add(1))

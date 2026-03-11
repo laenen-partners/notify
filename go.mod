@@ -2,7 +2,11 @@ module github.com/laenen-partners/notify
 
 go 1.25.6
 
-require github.com/nats-io/nats.go v1.48.0
+require (
+	connectrpc.com/connect v1.19.1
+	github.com/nats-io/nats.go v1.48.0
+	google.golang.org/protobuf v1.36.11
+)
 
 require (
 	github.com/klauspost/compress v1.18.0 // indirect

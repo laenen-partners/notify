@@ -1,0 +1,20 @@
+syntax = "proto3";
+package notify.v1;
+option go_package = "github.com/laenen-partners/notify/gen/notify/v1;notifyv1";
+
+// NotificationService handles delivery of notifications through
+// non-stream channels (email, SMS, push). Stream scope invalidations
+// bypass this service and go directly to NATS.
+service NotificationService {
+  // SendEmail sends an email via the configured SMTP backend.
+  rpc SendEmail(SendEmailRequest) returns (SendEmailResponse);
+}
+
+message SendEmailRequest {
+  string to = 1;
+  string subject = 2;
+  string html = 3;
+  string text = 4;
+}
+
+message SendEmailResponse {}
